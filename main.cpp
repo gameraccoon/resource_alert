@@ -384,10 +384,16 @@ bool doPeriodicCheck(const Args& args, AppState& appState, std::string& readBuff
 	if (memConsumptionPct >= args.memThresholdPct)
 	{
 		const auto timeNow = std::chrono::system_clock::now();
-		const bool couldSave = saveCommandOutput("ps aux --sort=-%mem", std::format("mem_report_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
-		if (!couldSave)
+		const bool couldSavePs = saveCommandOutput("ps aux --sort=-%mem", std::format("mem_report_ps_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
+		if (!couldSavePs)
 		{
-			printf("Could not save mem report to file\n");
+			printf("Could not save mem report from ps to file\n");
+		}
+
+		const bool couldSaveTop = saveCommandOutput("top -b -n 1 -o =%MEM", std::format("mem_report_top_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
+		if (!couldSaveTop)
+		{
+			printf("Could not save mem report from top to file\n");
 		}
 
 		trySendNotification(args, appState.lastMemAlertSentTime, "Memory consumption is high", memConsumptionPct);
