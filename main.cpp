@@ -111,8 +111,15 @@ struct Args
 	float memThresholdPct = 70.0f;
 	// [0.0, 100.0)
 	float cpuThresholdPct = 70.0f;
-	size_t secondsBetweenChecks = 60;
+	size_t timeBetweenChecksSec = 60;
 	std::string runCustomScript;
+	size_t notificationThrottleSec = 20 * 60;
+};
+
+struct AppState
+{
+	std::chrono::time_point<std::chrono::system_clock> lastMemAlertSentTime;
+	std::chrono::time_point<std::chrono::system_clock> lastCpuAlertSentTime;
 };
 
 template<typename T>
@@ -208,12 +215,16 @@ Args readArgs(int argc, char** argv)
 					isMissingValue = !readArgValue(args.cpuThresholdPct, argc, argv, i);
 					isFound = true;
 					break;
-				case 's':
-					isMissingValue = !readArgValue(args.secondsBetweenChecks, argc, argv, i);
+				case 't':
+					isMissingValue = !readArgValue(args.timeBetweenChecksSec, argc, argv, i);
 					isFound = true;
 					break;
 				case 'r':
 					isMissingValue = !readArgValue(args.runCustomScript, argc, argv, i);
+					isFound = true;
+					break;
+				case 'n':
+					isMissingValue = !readArgValue(args.notificationThrottleSec, argc, argv, i);
 					isFound = true;
 					break;
 				}
@@ -234,6 +245,24 @@ Args readArgs(int argc, char** argv)
 	}
 
 	return args;
+}
+
+void trySendNotification(const Args& args, auto& lastSendTime, std::string_view errorTitle, float consumptionPct)
+{
+	if (!args.runCustomScript.empty())
+	{
+		const auto timeNow = std::chrono::system_clock::now();
+		if (timeNow > lastSendTime + std::chrono::seconds(args.notificationThrottleSec))
+		{
+			const std::string command = std::format("{} '{}. Consumption is {}%'", args.runCustomScript, errorTitle, consumptionPct);
+			const int resultCode = std::system(command.data());
+			if (resultCode != 0)
+			{
+				printf("Notification script exited with non-zero code %d\n", resultCode);
+			}
+			lastSendTime = timeNow;
+		}
+	}
 }
 
 int getFreePartValue(std::string& buffer, size_t partIndex)
@@ -262,7 +291,7 @@ int getFreePartValue(std::string& buffer, size_t partIndex)
 	std::optional<int> parsedNumber = parseInt(numberPart.data(), 10);
 	if (!parsedNumber.has_value())
 	{
-		printf("Failed to parse number '%s' from 'free -L' output '%s'", numberPart.data(), buffer.data());
+		printf("Failed to parse number '%s' from 'free -L' output '%s'\n", numberPart.data(), buffer.data());
 		return 0;
 	}
 
@@ -275,7 +304,7 @@ float checkMemory(std::string& buffer)
 	const bool hasExecuted = readCommandOutput("free -L", buffer);
 	if (!hasExecuted)
 	{
-		printf("Could not execute 'free -L'");
+		printf("Could not execute 'free -L'\n");
 	}
 
 	const int usedValue = getFreePartValue(buffer, 2);
@@ -310,7 +339,7 @@ float checkCpu(std::string& buffer)
 	const bool hasExecuted = readCommandOutput("sar --dec=0 1 1 | tail -n 3", buffer);
 	if (!hasExecuted)
 	{
-		printf("Could not execute 'sar --dec=0 1 1 | tail -n 3'");
+		printf("Could not execute 'sar --dec=0 1 1 | tail -n 3'\n");
 	}
 
 	// first find the offset of %idle column in the first line
@@ -332,7 +361,7 @@ float checkCpu(std::string& buffer)
 
 	if (idleOffset == -1)
 	{
-		printf("Could not find idle column in 'sar --dec=0 1 1 | tail -n 3' output");
+		printf("Could not find idle column in 'sar --dec=0 1 1 | tail -n 3' output\n");
 		return 0;
 	}
 
@@ -340,18 +369,16 @@ float checkCpu(std::string& buffer)
 	std::string numberPart = buffer.substr(secondLineStart + idleOffset + 2, 3);
 	std::optional<int> parsedNumber = parseInt(numberPart.data(), 10);
 
-	printf("'%s'\n", numberPart.data());
-
 	if (!parsedNumber.has_value())
 	{
-		printf("Failed to parse number '%s' from 'sar --dec=0 1 1 | tail -n 3' output '%s'", numberPart.data(), buffer.data());
+		printf("Failed to parse number '%s' from 'sar --dec=0 1 1 | tail -n 3' output '%s'\n", numberPart.data(), buffer.data());
 		return 0;
 	}
 
 	return float(100 - *parsedNumber);
 }
 
-bool doPeriodicCheck(const Args& args, std::string& readBuffer)
+bool doPeriodicCheck(const Args& args, AppState& appState, std::string& readBuffer)
 {
 	const float memConsumptionPct = checkMemory(readBuffer);
 	if (memConsumptionPct >= args.memThresholdPct)
@@ -360,9 +387,10 @@ bool doPeriodicCheck(const Args& args, std::string& readBuffer)
 		const bool couldSave = saveCommandOutput("ps aux --sort=-%mem", std::format("mem_report_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
 		if (!couldSave)
 		{
-			printf("Could not save mem report to file");
-			return false;
+			printf("Could not save mem report to file\n");
 		}
+
+		trySendNotification(args, appState.lastMemAlertSentTime, "Memory consumption is high", memConsumptionPct);
 	}
 
 	const float cpuConsumptionPct = checkCpu(readBuffer);
@@ -372,9 +400,10 @@ bool doPeriodicCheck(const Args& args, std::string& readBuffer)
 		const bool couldSave = saveCommandOutput("ps aux --sort=-%cpu", std::format("cpu_report_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(cpuConsumptionPct)));
 		if (!couldSave)
 		{
-			printf("Could not save cpu report to file");
-			return false;
+			printf("Could not save cpu report to file\n");
 		}
+
+		trySendNotification(args, appState.lastCpuAlertSentTime, "CPU consumption is high", cpuConsumptionPct);
 	}
 
 	return true;
@@ -382,14 +411,15 @@ bool doPeriodicCheck(const Args& args, std::string& readBuffer)
 
 int main(int argc, char** argv)
 {
-	Args args = readArgs(argc, argv);
+	const Args args = readArgs(argc, argv);
+	AppState appState;
 
 	std::string readBuffer;
 	readBuffer.reserve(256);
 
 	while (true)
 	{
-		doPeriodicCheck(args, readBuffer);
-		sleep(args.secondsBetweenChecks);
+		doPeriodicCheck(args, appState, readBuffer);
+		sleep(args.timeBetweenChecksSec);
 	}
 }
