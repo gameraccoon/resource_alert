@@ -254,7 +254,7 @@ void trySendNotification(const Args& args, auto& lastSendTime, std::string_view 
 		const auto timeNow = std::chrono::system_clock::now();
 		if (timeNow > lastSendTime + std::chrono::seconds(args.notificationThrottleSec))
 		{
-			const std::string command = std::format("{} '{}. Consumption is {}%'", args.runCustomScript, errorTitle, consumptionPct);
+			const std::string command = std::format("{} '{}. Consumption is {:.2f}%'", args.runCustomScript, errorTitle, consumptionPct);
 			const int resultCode = std::system(command.data());
 			if (resultCode != 0)
 			{
