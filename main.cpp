@@ -1,12 +1,20 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <format>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+
+enum class ExitReason : uint8_t
+{
+	UnknownArgument = 1,
+	MissingArgumentValue = 2,
+	TooManyReportFiles = 3,
+};
 
 // need this while compilers align on how they support C++23 features
 template<typename Deleter>
@@ -68,6 +76,11 @@ std::optional<int> parseInt(const char* str, const int base)
 	return static_cast<int>(l);
 }
 
+void stopExecution(ExitReason reason)
+{
+	exit(static_cast<int>(reason));
+}
+
 bool readCommandOutput(std::string_view cmd, std::string& outResult) noexcept
 {
 	std::array<char, 128> buffer;
@@ -114,6 +127,7 @@ struct Args
 	size_t timeBetweenChecksSec = 60;
 	std::string runCustomScript;
 	size_t notificationThrottleSec = 20 * 60;
+	size_t limitReportFiles = 1000;
 };
 
 struct AppState
@@ -227,20 +241,24 @@ Args readArgs(int argc, char** argv)
 					isMissingValue = !readArgValue(args.notificationThrottleSec, argc, argv, i);
 					isFound = true;
 					break;
+				case 'l':
+					isMissingValue = !readArgValue(args.limitReportFiles, argc, argv, i);
+					isFound = true;
+					break;
 				}
 			}
 		}
 
 		if (!isFound)
 		{
-			printf("Unknown argument '%s'\n", argv[i]);
-			exit(1);
+			fprintf(stderr, "Unknown argument '%s'\n", argv[i]);
+			stopExecution(ExitReason::UnknownArgument);
 		}
 
 		if (isMissingValue)
 		{
-			printf("Argument '%s' did not have a valid value\n", argv[i]);
-			exit(2);
+			fprintf(stderr, "Argument '%s' did not have a valid value\n", argv[i]);
+			stopExecution(ExitReason::MissingArgumentValue);
 		}
 	}
 
@@ -258,7 +276,7 @@ void trySendNotification(const Args& args, auto& lastSendTime, std::string_view 
 			const int resultCode = std::system(command.data());
 			if (resultCode != 0)
 			{
-				printf("Notification script exited with non-zero code %d\n", resultCode);
+				fprintf(stderr, "Notification script exited with non-zero code %d\n", resultCode);
 			}
 			lastSendTime = timeNow;
 		}
@@ -291,7 +309,7 @@ int getFreePartValue(std::string& buffer, size_t partIndex)
 	std::optional<int> parsedNumber = parseInt(numberPart.data(), 10);
 	if (!parsedNumber.has_value())
 	{
-		printf("Failed to parse number '%s' from 'free -L' output '%s'\n", numberPart.data(), buffer.data());
+		fprintf(stderr, "Failed to parse number '%s' from 'free -L' output '%s'\n", numberPart.data(), buffer.data());
 		return 0;
 	}
 
@@ -304,7 +322,7 @@ float checkMemory(std::string& buffer)
 	const bool hasExecuted = readCommandOutput("free -L", buffer);
 	if (!hasExecuted)
 	{
-		printf("Could not execute 'free -L'\n");
+		fprintf(stderr, "Could not execute 'free -L'\n");
 	}
 
 	const int usedValue = getFreePartValue(buffer, 2);
@@ -339,7 +357,7 @@ float checkCpu(std::string& buffer)
 	const bool hasExecuted = readCommandOutput("sar --dec=0 1 1 | tail -n 3", buffer);
 	if (!hasExecuted)
 	{
-		printf("Could not execute 'sar --dec=0 1 1 | tail -n 3'\n");
+		fprintf(stderr, "Could not execute 'sar --dec=0 1 1 | tail -n 3'\n");
 	}
 
 	// first find the offset of %idle column in the first line
@@ -361,7 +379,7 @@ float checkCpu(std::string& buffer)
 
 	if (idleOffset == -1)
 	{
-		printf("Could not find idle column in 'sar --dec=0 1 1 | tail -n 3' output\n");
+		fprintf(stderr, "Could not find idle column in 'sar --dec=0 1 1 | tail -n 3' output\n");
 		return 0;
 	}
 
@@ -371,7 +389,7 @@ float checkCpu(std::string& buffer)
 
 	if (!parsedNumber.has_value())
 	{
-		printf("Failed to parse number '%s' from 'sar --dec=0 1 1 | tail -n 3' output '%s'\n", numberPart.data(), buffer.data());
+		fprintf(stderr, "Failed to parse number '%s' from 'sar --dec=0 1 1 | tail -n 3' output '%s'\n", numberPart.data(), buffer.data());
 		return 0;
 	}
 
@@ -380,20 +398,22 @@ float checkCpu(std::string& buffer)
 
 bool doPeriodicCheck(const Args& args, AppState& appState, std::string& readBuffer)
 {
+	bool foundIssues = false;
 	const float memConsumptionPct = checkMemory(readBuffer);
 	if (memConsumptionPct >= args.memThresholdPct)
 	{
+		foundIssues = true;
 		const auto timeNow = std::chrono::system_clock::now();
-		const bool couldSavePs = saveCommandOutput("ps aux --sort=-%mem", std::format("mem_report_ps_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
+		const bool couldSavePs = saveCommandOutput("ps aux --sort=-%mem", std::format("reports/mem_report_ps_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
 		if (!couldSavePs)
 		{
-			printf("Could not save mem report from ps to file\n");
+			fprintf(stderr, "Could not save mem report from ps to file\n");
 		}
 
-		const bool couldSaveTop = saveCommandOutput("top -b -n 1 -o =%MEM", std::format("mem_report_top_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
+		const bool couldSaveTop = saveCommandOutput("top -b -n 1 -o =%MEM", std::format("reports/mem_report_top_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(memConsumptionPct)));
 		if (!couldSaveTop)
 		{
-			printf("Could not save mem report from top to file\n");
+			fprintf(stderr, "Could not save mem report from top to file\n");
 		}
 
 		trySendNotification(args, appState.lastMemAlertSentTime, "Memory consumption is high", memConsumptionPct);
@@ -402,17 +422,33 @@ bool doPeriodicCheck(const Args& args, AppState& appState, std::string& readBuff
 	const float cpuConsumptionPct = checkCpu(readBuffer);
 	if (cpuConsumptionPct >= args.cpuThresholdPct)
 	{
+		foundIssues = true;
 		const auto timeNow = std::chrono::system_clock::now();
-		const bool couldSave = saveCommandOutput("ps aux --sort=-%cpu", std::format("cpu_report_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(cpuConsumptionPct)));
+		const bool couldSave = saveCommandOutput("ps aux --sort=-%cpu", std::format("reports/cpu_report_{:%y%m%d_%H%M%OS}_{}.txt", timeNow, int(cpuConsumptionPct)));
 		if (!couldSave)
 		{
-			printf("Could not save cpu report to file\n");
+			fprintf(stderr, "Could not save cpu report to file\n");
 		}
 
 		trySendNotification(args, appState.lastCpuAlertSentTime, "CPU consumption is high", cpuConsumptionPct);
 	}
 
-	return true;
+	return foundIssues;
+}
+
+void checkFileOverflow(const Args& args)
+{
+	if (args.limitReportFiles == 0)
+	{
+		return;
+	}
+
+	auto it = std::filesystem::directory_iterator{"reports"};
+	if (std::count_if(it, {}, [](auto& x){return x.is_regular_file(); }) > int(args.limitReportFiles))
+	{
+		fprintf(stderr, "Too many files in the report folder, stopping the service to not consume all the space\n");
+		stopExecution(ExitReason::TooManyReportFiles);
+	}
 }
 
 int main(int argc, char** argv)
@@ -420,12 +456,22 @@ int main(int argc, char** argv)
 	const Args args = readArgs(argc, argv);
 	AppState appState;
 
+	if (!std::filesystem::is_directory("reports"))
+	{
+		std::filesystem::create_directory("reports");
+	}
+
 	std::string readBuffer;
 	readBuffer.reserve(256);
 
 	while (true)
 	{
-		doPeriodicCheck(args, appState, readBuffer);
+		const bool foundIssues = doPeriodicCheck(args, appState, readBuffer);
+		if (foundIssues)
+		{
+			checkFileOverflow(args);
+		}
+
 		sleep(args.timeBetweenChecksSec);
 	}
 }
